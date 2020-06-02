@@ -33,6 +33,7 @@ import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.SymbolFunction;
 import io.questdb.griffin.engine.functions.constants.LongConstant;
 import io.questdb.griffin.engine.groupby.*;
+import io.questdb.griffin.engine.groupby.vect.GroupByRecordCursorFactory;
 import io.questdb.griffin.engine.groupby.vect.*;
 import io.questdb.griffin.engine.join.*;
 import io.questdb.griffin.engine.orderby.RecordComparatorCompiler;
@@ -53,6 +54,14 @@ import static io.questdb.griffin.model.ExpressionNode.LITERAL;
 
 public class SqlCodeGenerator implements Mutable {
     private static final IntHashSet limitTypes = new IntHashSet();
+
+    static {
+        limitTypes.add(ColumnType.LONG);
+        limitTypes.add(ColumnType.BYTE);
+        limitTypes.add(ColumnType.SHORT);
+        limitTypes.add(ColumnType.INT);
+    }
+
     private final WhereClauseParser whereClauseParser = new WhereClauseParser();
     private final FunctionParser functionParser;
     private final CairoEngine engine;
@@ -67,6 +76,9 @@ public class SqlCodeGenerator implements Mutable {
     private final ArrayColumnTypes valueTypes = new ArrayColumnTypes();
     private final EntityColumnFilter entityColumnFilter = new EntityColumnFilter();
     private final ObjList<CharSequence> symbolValueList = new ObjList<>();
+    private final ObjList<VectorAggregateFunction> tempVaf = new ObjList<>();
+    private final GenericRecordMetadata tempMetadata = new GenericRecordMetadata();
+    private final ArrayColumnTypes arrayColumnTypes = new ArrayColumnTypes();
     private boolean fullFatJoins = false;
 
     public SqlCodeGenerator(
@@ -90,6 +102,9 @@ public class SqlCodeGenerator implements Mutable {
         return GenericRecordMetadata.copyOf(that);
     }
 
+    private final IntList tempKeyIndexes = new IntList();
+    private final IntList tempSymbolSkewIndexes = new IntList();
+
     private RecordCursorFactory createAsOfJoin(
             RecordMetadata metadata,
             RecordCursorFactory master,
@@ -98,7 +113,7 @@ public class SqlCodeGenerator implements Mutable {
             RecordSink slaveKeySink,
             int columnSplit
     ) {
-        valueTypes.reset();
+        valueTypes.clear();
         valueTypes.add(ColumnType.LONG);
         valueTypes.add(ColumnType.LONG);
 
@@ -113,6 +128,45 @@ public class SqlCodeGenerator implements Mutable {
                 slaveKeySink,
                 columnSplit
         );
+    }
+
+    @NotNull
+    private JoinRecordMetadata createJoinMetadata(
+            CharSequence masterAlias,
+            RecordMetadata masterMetadata,
+            CharSequence slaveAlias,
+            RecordMetadata slaveMetadata
+    ) {
+        return createJoinMetadata(
+                masterAlias,
+                masterMetadata,
+                slaveAlias,
+                slaveMetadata,
+                masterMetadata.getTimestampIndex()
+        );
+    }
+
+    @NotNull
+    private JoinRecordMetadata createJoinMetadata(
+            CharSequence masterAlias,
+            RecordMetadata masterMetadata,
+            CharSequence slaveAlias,
+            RecordMetadata slaveMetadata,
+            int timestampIndex
+    ) {
+        JoinRecordMetadata metadata;
+        metadata = new JoinRecordMetadata(
+                configuration,
+                masterMetadata.getColumnCount() + slaveMetadata.getColumnCount()
+        );
+
+        metadata.copyColumnMetadataFrom(masterAlias, masterMetadata);
+        metadata.copyColumnMetadataFrom(slaveAlias, slaveMetadata);
+
+        if (timestampIndex != -1) {
+            metadata.setTimestampIndex(timestampIndex);
+        }
+        return metadata;
     }
 
     @NotNull
@@ -177,7 +231,7 @@ public class SqlCodeGenerator implements Mutable {
         // we add to metadata all slave columns that are not keys.
         // Add same columns to filter while we are in this loop.
         listColumnFilterB.clear();
-        valueTypes.reset();
+        valueTypes.clear();
         ArrayColumnTypes slaveTypes = new ArrayColumnTypes();
         for (int i = 0, n = slaveMetadata.getColumnCount(); i < n; i++) {
             if (intHashSet.excludes(i)) {
@@ -275,7 +329,7 @@ public class SqlCodeGenerator implements Mutable {
                 true
         );
 
-        valueTypes.reset();
+        valueTypes.clear();
         valueTypes.add(ColumnType.LONG);
         valueTypes.add(ColumnType.LONG);
 
@@ -344,45 +398,6 @@ public class SqlCodeGenerator implements Mutable {
         );
     }
 
-    @NotNull
-    private JoinRecordMetadata createJoinMetadata(
-            CharSequence masterAlias,
-            RecordMetadata masterMetadata,
-            CharSequence slaveAlias,
-            RecordMetadata slaveMetadata
-    ) {
-        return createJoinMetadata(
-                masterAlias,
-                masterMetadata,
-                slaveAlias,
-                slaveMetadata,
-                masterMetadata.getTimestampIndex()
-        );
-    }
-
-    @NotNull
-    private JoinRecordMetadata createJoinMetadata(
-            CharSequence masterAlias,
-            RecordMetadata masterMetadata,
-            CharSequence slaveAlias,
-            RecordMetadata slaveMetadata,
-            int timestampIndex
-    ) {
-        JoinRecordMetadata metadata;
-        metadata = new JoinRecordMetadata(
-                configuration,
-                masterMetadata.getColumnCount() + slaveMetadata.getColumnCount()
-        );
-
-        metadata.copyColumnMetadataFrom(masterAlias, masterMetadata);
-        metadata.copyColumnMetadataFrom(slaveAlias, slaveMetadata);
-
-        if (timestampIndex != -1) {
-            metadata.setTimestampIndex(timestampIndex);
-        }
-        return metadata;
-    }
-
     private RecordCursorFactory createSpliceJoin(
             RecordMetadata metadata,
             RecordCursorFactory master,
@@ -391,7 +406,7 @@ public class SqlCodeGenerator implements Mutable {
             RecordSink slaveKeySink,
             int columnSplit
     ) {
-        valueTypes.reset();
+        valueTypes.clear();
         valueTypes.add(ColumnType.LONG); // master previous
         valueTypes.add(ColumnType.LONG); // master current
         valueTypes.add(ColumnType.LONG); // slave previous
@@ -410,103 +425,130 @@ public class SqlCodeGenerator implements Mutable {
         );
     }
 
-    private ObjList<VectorAggregateFunction> createVectorAggregateFunctions(
+    private void addVaf(VectorAggregateFunction vaf, CharSequence columnName) {
+        tempVaf.add(vaf);
+        tempMetadata.add(new TableColumnMetadata(Chars.toString(columnName), vaf.getType()));
+    }
+
+    private boolean createVectorAggregateFunctions(
             ObjList<QueryColumn> columns,
             RecordMetadata metadata,
             int workerCount
     ) {
-        ObjList<VectorAggregateFunction> vafList = new ObjList<>();
+        tempVaf.clear();
+        tempMetadata.clear();
+        tempKeyIndexes.clear();
+        tempSymbolSkewIndexes.clear();
+
         for (int i = 0, n = columns.size(); i < n; i++) {
             final QueryColumn qc = columns.getQuick(i);
             final ExpressionNode ast = qc.getAst();
-            if (isSingleColumnFunction(ast, "sum")) {
-                final int columnIndex = metadata.getColumnIndex(ast.rhs.token);
+            if (ast.type == LITERAL) {
+                final int columnIndex = metadata.getColumnIndex(ast.token);
                 final int type = metadata.getColumnType(columnIndex);
-                if (type == ColumnType.DOUBLE) {
-                    vafList.add(new SumDoubleVectorAggregateFunction(ast.rhs.position, columnIndex, workerCount));
+                if (type == ColumnType.INT) {
+                    tempKeyIndexes.add(columnIndex);
+                    tempMetadata.add(new TableColumnMetadata(
+                            Chars.toString(qc.getName()),
+                            type
+                    ));
                     continue;
-                } else if (type == ColumnType.INT) {
-                    vafList.add(new SumIntVectorAggregateFunction(ast.rhs.position, columnIndex));
-                    continue;
-                } else if (type == ColumnType.LONG) {
-                    vafList.add(new SumLongVectorAggregateFunction(ast.rhs.position, columnIndex));
-                    continue;
-                } else if (type == ColumnType.DATE) {
-                    vafList.add(new SumDateVectorAggregateFunction(ast.rhs.position, columnIndex));
-                    continue;
-                } else if (type == ColumnType.TIMESTAMP) {
-                    vafList.add(new SumTimestampVectorAggregateFunction(ast.rhs.position, columnIndex));
+                } else if (type == ColumnType.SYMBOL) {
+                    tempKeyIndexes.add(columnIndex);
+                    tempMetadata.add(new TableColumnMetadata(Chars.toString(qc.getName()), type, false, 0, metadata.isSymbolTableStatic(columnIndex)));
+                    tempSymbolSkewIndexes.extendAndSet(i, columnIndex);
                     continue;
                 }
-            } else if (isSingleColumnFunction(ast, "ksum")) {
-                final int columnIndex = metadata.getColumnIndex(ast.rhs.token);
-                final int type = metadata.getColumnType(columnIndex);
-                if (type == ColumnType.DOUBLE) {
-                    vafList.add(new KSumDoubleVectorAggregateFunction(ast.rhs.position, columnIndex, workerCount));
-                    continue;
-                }
-            } else if (isSingleColumnFunction(ast, "nsum")) {
-                final int columnIndex = metadata.getColumnIndex(ast.rhs.token);
-                final int type = metadata.getColumnType(columnIndex);
-                if (type == ColumnType.DOUBLE) {
-                    vafList.add(new NSumDoubleVectorAggregateFunction(ast.rhs.position, columnIndex, workerCount));
-                    continue;
-                }
-            } else if (isSingleColumnFunction(ast, "avg")) {
-                final int columnIndex = metadata.getColumnIndex(ast.rhs.token);
-                final int type = metadata.getColumnType(columnIndex);
-                if (type == ColumnType.DOUBLE) {
-                    vafList.add(new AvgDoubleVectorAggregateFunction(ast.rhs.position, columnIndex));
-                    continue;
-                } else if (type == ColumnType.INT) {
-                    vafList.add(new AvgIntVectorAggregateFunction(ast.rhs.position, columnIndex));
-                    continue;
-                } else if (type == ColumnType.LONG || type == ColumnType.TIMESTAMP || type == ColumnType.DATE) {
-                    vafList.add(new AvgLongVectorAggregateFunction(ast.rhs.position, columnIndex));
-                    continue;
-                }
-            } else if (isSingleColumnFunction(ast, "min")) {
-                final int columnIndex = metadata.getColumnIndex(ast.rhs.token);
-                final int type = metadata.getColumnType(columnIndex);
-                if (type == ColumnType.DOUBLE) {
-                    vafList.add(new MinDoubleVectorAggregateFunction(ast.rhs.position, columnIndex));
-                    continue;
-                } else if (type == ColumnType.INT) {
-                    vafList.add(new MinIntVectorAggregateFunction(ast.rhs.position, columnIndex));
-                    continue;
-                } else if (type == ColumnType.LONG) {
-                    vafList.add(new MinLongVectorAggregateFunction(ast.rhs.position, columnIndex));
-                    continue;
-                } else if (type == ColumnType.DATE) {
-                    vafList.add(new MinDateVectorAggregateFunction(ast.rhs.position, columnIndex));
-                    continue;
-                } else if (type == ColumnType.TIMESTAMP) {
-                    vafList.add(new MinTimestampVectorAggregateFunction(ast.rhs.position, columnIndex));
-                    continue;
-                }
-            } else if (isSingleColumnFunction(ast, "max")) {
-                final int columnIndex = metadata.getColumnIndex(ast.rhs.token);
-                final int type = metadata.getColumnType(columnIndex);
-                if (type == ColumnType.DOUBLE) {
-                    vafList.add(new MaxDoubleVectorAggregateFunction(ast.rhs.position, columnIndex));
-                    continue;
-                } else if (type == ColumnType.INT) {
-                    vafList.add(new MaxIntVectorAggregateFunction(ast.rhs.position, columnIndex));
-                    continue;
-                } else if (type == ColumnType.LONG) {
-                    vafList.add(new MaxLongVectorAggregateFunction(ast.rhs.position, columnIndex));
-                    continue;
-                } else if (type == ColumnType.DATE) {
-                    vafList.add(new MaxDateVectorAggregateFunction(ast.rhs.position, columnIndex));
-                    continue;
-                } else if (type == ColumnType.TIMESTAMP) {
-                    vafList.add(new MaxTimestampVectorAggregateFunction(ast.rhs.position, columnIndex));
-                    continue;
+            } else {
+                if (isSingleColumnFunction(ast, "sum")) {
+                    final int columnIndex = metadata.getColumnIndex(ast.rhs.token);
+                    final int type = metadata.getColumnType(columnIndex);
+                    if (type == ColumnType.DOUBLE) {
+                        addVaf(new SumDoubleVectorAggregateFunction(ast.rhs.position, columnIndex, workerCount), qc.getName());
+                        continue;
+                    } else if (type == ColumnType.INT) {
+                        addVaf(new SumIntVectorAggregateFunction(ast.rhs.position, columnIndex), qc.getName());
+                        continue;
+                    } else if (type == ColumnType.LONG) {
+                        addVaf(new SumLongVectorAggregateFunction(ast.rhs.position, columnIndex), qc.getName());
+                        continue;
+                    } else if (type == ColumnType.DATE) {
+                        addVaf(new SumDateVectorAggregateFunction(ast.rhs.position, columnIndex), qc.getName());
+                        continue;
+                    } else if (type == ColumnType.TIMESTAMP) {
+                        addVaf(new SumTimestampVectorAggregateFunction(ast.rhs.position, columnIndex), qc.getName());
+                        continue;
+                    }
+                } else if (isSingleColumnFunction(ast, "ksum")) {
+                    final int columnIndex = metadata.getColumnIndex(ast.rhs.token);
+                    final int type = metadata.getColumnType(columnIndex);
+                    if (type == ColumnType.DOUBLE) {
+                        addVaf(new KSumDoubleVectorAggregateFunction(ast.rhs.position, columnIndex, workerCount), qc.getName());
+                        continue;
+                    }
+                } else if (isSingleColumnFunction(ast, "nsum")) {
+                    final int columnIndex = metadata.getColumnIndex(ast.rhs.token);
+                    final int type = metadata.getColumnType(columnIndex);
+                    if (type == ColumnType.DOUBLE) {
+                        addVaf(new NSumDoubleVectorAggregateFunction(ast.rhs.position, columnIndex, workerCount), qc.getName());
+                        continue;
+                    }
+                } else if (isSingleColumnFunction(ast, "avg")) {
+                    final int columnIndex = metadata.getColumnIndex(ast.rhs.token);
+                    final int type = metadata.getColumnType(columnIndex);
+                    if (type == ColumnType.DOUBLE) {
+                        addVaf(new AvgDoubleVectorAggregateFunction(ast.rhs.position, columnIndex), qc.getName());
+                        continue;
+                    } else if (type == ColumnType.INT) {
+                        addVaf(new AvgIntVectorAggregateFunction(ast.rhs.position, columnIndex), qc.getName());
+                        continue;
+                    } else if (type == ColumnType.LONG || type == ColumnType.TIMESTAMP || type == ColumnType.DATE) {
+                        addVaf(new AvgLongVectorAggregateFunction(ast.rhs.position, columnIndex), qc.getName());
+                        continue;
+                    }
+                } else if (isSingleColumnFunction(ast, "min")) {
+                    final int columnIndex = metadata.getColumnIndex(ast.rhs.token);
+                    final int type = metadata.getColumnType(columnIndex);
+                    if (type == ColumnType.DOUBLE) {
+                        addVaf(new MinDoubleVectorAggregateFunction(ast.rhs.position, columnIndex), qc.getName());
+                        continue;
+                    } else if (type == ColumnType.INT) {
+                        addVaf(new MinIntVectorAggregateFunction(ast.rhs.position, columnIndex), qc.getName());
+                        continue;
+                    } else if (type == ColumnType.LONG) {
+                        addVaf(new MinLongVectorAggregateFunction(ast.rhs.position, columnIndex), qc.getName());
+                        continue;
+                    } else if (type == ColumnType.DATE) {
+                        addVaf(new MinDateVectorAggregateFunction(ast.rhs.position, columnIndex), qc.getName());
+                        continue;
+                    } else if (type == ColumnType.TIMESTAMP) {
+                        addVaf(new MinTimestampVectorAggregateFunction(ast.rhs.position, columnIndex), qc.getName());
+                        continue;
+                    }
+                } else if (isSingleColumnFunction(ast, "max")) {
+                    final int columnIndex = metadata.getColumnIndex(ast.rhs.token);
+                    final int type = metadata.getColumnType(columnIndex);
+                    if (type == ColumnType.DOUBLE) {
+                        addVaf(new MaxDoubleVectorAggregateFunction(ast.rhs.position, columnIndex), qc.getName());
+                        continue;
+                    } else if (type == ColumnType.INT) {
+                        addVaf(new MaxIntVectorAggregateFunction(ast.rhs.position, columnIndex), qc.getName());
+                        continue;
+                    } else if (type == ColumnType.LONG) {
+                        addVaf(new MaxLongVectorAggregateFunction(ast.rhs.position, columnIndex), qc.getName());
+                        continue;
+                    } else if (type == ColumnType.DATE) {
+                        addVaf(new MaxDateVectorAggregateFunction(ast.rhs.position, columnIndex), qc.getName());
+                        continue;
+                    } else if (type == ColumnType.TIMESTAMP) {
+                        addVaf(new MaxTimestampVectorAggregateFunction(ast.rhs.position, columnIndex), qc.getName());
+                        continue;
+                    }
                 }
             }
-            return null;
+            return false;
         }
-        return vafList;
+        return true;
     }
 
     RecordCursorFactory generate(QueryModel model, SqlExecutionContext executionContext) throws SqlException {
@@ -1038,8 +1080,8 @@ public class SqlCodeGenerator implements Mutable {
             assert model.getNestedModel() != null;
             final int fillCount = sampleByFill.size();
             try {
-                keyTypes.reset();
-                valueTypes.reset();
+                keyTypes.clear();
+                valueTypes.clear();
                 listColumnFilterA.clear();
 
                 if (fillCount == 1 && Chars.equalsLowerCaseAscii(sampleByFill.getQuick(0).token, "linear")) {
@@ -1410,23 +1452,44 @@ public class SqlCodeGenerator implements Mutable {
 
             // inspect model for possibility of vector aggregate intrinsics
             if (factory.supportPageFrameCursor()) {
-                final ObjList<VectorAggregateFunction> vafList = createVectorAggregateFunctions(columns, metadata, executionContext.getWorkerCount());
-                if (vafList != null) {
-                    final GenericRecordMetadata m = new GenericRecordMetadata();
-                    for (int i = 0, n = vafList.size(); i < n; i++) {
-                        m.add(new TableColumnMetadata(
-                                Chars.toString(columns.getQuick(i).getName()),
-                                vafList.getQuick(i).getType()
-                        ));
+                if (createVectorAggregateFunctions(columns, metadata, executionContext.getWorkerCount())) {
+                    if (tempKeyIndexes.size() == 0) {
+                        return new GroupByNotKeyedVectorRecordCursorFactory(
+                                factory,
+                                GenericRecordMetadata.copyOf(tempMetadata),
+                                tempVaf
+                        );
                     }
-                    return new GroupByNotKeyedVectorRecordCursorFactory(factory, m, vafList);
+
+                    if (tempKeyIndexes.size() == 1) {
+
+                        arrayColumnTypes.clear();
+                        // this is overly generic, but we will catchup C code
+                        for (int i = 0, n = tempKeyIndexes.size(); i < n; i++) {
+                            arrayColumnTypes.add(tempMetadata.getColumnType(tempKeyIndexes.getQuick(i)));
+                        }
+
+                        for (int i = 0, n = tempVaf.size(); i < n; i++) {
+                            tempVaf.getQuick(i).pushValueTypes(arrayColumnTypes);
+                        }
+
+                        return new GroupByRecordCursorFactory(
+                                factory,
+                                GenericRecordMetadata.copyOf(tempMetadata),
+                                arrayColumnTypes,
+                                executionContext.getWorkerCount(),
+                                tempVaf,
+                                tempKeyIndexes.getQuick(0),
+                                tempSymbolSkewIndexes
+                        );
+                    }
                 }
             }
 
             final int timestampIndex = getTimestampIndex(model, factory);
 
-            keyTypes.reset();
-            valueTypes.reset();
+            keyTypes.clear();
+            valueTypes.clear();
             listColumnFilterA.clear();
 
             final int columnCount = model.getBottomUpColumns().size();
@@ -1465,7 +1528,7 @@ public class SqlCodeGenerator implements Mutable {
                 );
             }
 
-            return new GroupByRecordCursorFactory(
+            return new io.questdb.griffin.engine.groupby.GroupByRecordCursorFactory(
                     configuration,
                     factory,
                     listColumnFilterA,
@@ -1973,7 +2036,7 @@ public class SqlCodeGenerator implements Mutable {
                 true
         );
 
-        valueTypes.reset();
+        valueTypes.clear();
 
         RecordCursorFactory unionFactory = new UnionRecordCursorFactory(
                 configuration,
@@ -2059,7 +2122,7 @@ public class SqlCodeGenerator implements Mutable {
         }
 
         // compare types and populate keyTypes
-        keyTypes.reset();
+        keyTypes.clear();
         for (int k = 0, m = listColumnFilterA.getColumnCount(); k < m; k++) {
             int columnType = masterMetadata.getColumnType(listColumnFilterB.getColumnIndex(k));
             if (columnType != slaveMetadata.getColumnType(listColumnFilterA.getColumnIndex(k))) {
@@ -2115,12 +2178,5 @@ public class SqlCodeGenerator implements Mutable {
         }
 
         return zeroColumnType == ColumnType.STRING ? Record.GET_STR : Record.GET_SYM;
-    }
-
-    static {
-        limitTypes.add(ColumnType.LONG);
-        limitTypes.add(ColumnType.BYTE);
-        limitTypes.add(ColumnType.SHORT);
-        limitTypes.add(ColumnType.INT);
     }
 }
